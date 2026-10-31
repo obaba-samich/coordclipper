@@ -1,0 +1,30 @@
+{
+  "schemaVersion": 1,
+  "id": "coordclipper",
+  "version": "${version}",
+  "name": "Coord Clipper",
+  "description": "Meteor Client addon that adds .coordclip <x> <y> <z>: pathfinds to the given coordinates through a chain of vclips and hclips and lands on the nearest solid ground.",
+  "authors": [
+    "obaba"
+  ],
+  "icon": "assets/coordclipper/icon.png",
+  "environment": "client",
+  "entrypoints": {
+    "meteor": [
+      "com.coordclipper.CoordClipper"
+    ]
+  },
+  "custom": {
+    "meteor-client:color": "70,190,240",
+    "modmenu": {
+      "parent": {
+        "id": "meteor-client"
+      }
+    }
+  },
+  "depends": {
+    "java": ">=21",
+    "minecraft": ["${mc_version}"],
+    "meteor-client": "*"
+  }
+}
