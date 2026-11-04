@@ -3,7 +3,9 @@
 A [Meteor Client](https://github.com/MeteorDevelopment/meteor-client) addon that pathfinds to coordinates with a chain
 of vclips and hclips and lands you on the nearest solid ground.
 
-Built for Minecraft 1.21.11.
+Built and tested for Minecraft **1.21.11**. Jars for 1.21.4 to 1.21.10 (except 1.21.9, which Meteor skipped) and
+26.1.2 to 26.3 are **experimental**: they compile, but haven't been tested in game. Each version has its own jar, get the
+one for your Minecraft version from the [releases](https://github.com/obaba-samich/coordclipper/releases).
 
 ## Usage
 
@@ -68,8 +70,28 @@ vanilla check passes, a plugin or anticheat.
 
 ## Building
 
+Needs JDK 25 or newer, for every version (older versions are still compiled for Java 21).
+
 ```bash
-./gradlew build
+./gradlew build                  # Minecraft 1.21.11, the default
+./gradlew build -Pmc=26.3        # any version in versions/
+./build-all.sh                   # every version
+./build-all.sh 1.21.8 26.3       # only these
 ```
 
-The jar is written to `build/libs/`. Put it in your `mods` folder next to Meteor Client.
+Jars are written to `build/libs/` as `coord-clipper-mc<version>-<mod version>.jar`. Put the one for your Minecraft
+version in your `mods` folder next to Meteor Client for the same version.
+
+### Layout
+
+| Path                       | What                                                                                    |
+|----------------------------|-----------------------------------------------------------------------------------------|
+| `versions/<mc>.properties` | Minecraft, mappings, Fabric loader, Meteor and Java version for each supported version. |
+| `src/mc1.21/java`          | Sources for 1.21.x, with Yarn names (remapped at build time).                           |
+| `src/mc26/java`            | Sources for 26.x, with Mojang's names (26.x isn't obfuscated). Same code, same logic.   |
+| `src/compat/<x>/java`      | `Compat.java`: the few calls that changed between versions of the same family.          |
+| `src/main/resources`       | `fabric.mod.json` and the icon, shared by all versions.                                 |
+
+Make changes in `src/mc1.21`, then run `python3 scripts/port26.py` to regenerate `src/mc26` from it (don't edit
+`src/mc26` by hand). To add a Minecraft version, copy the
+closest file in `versions/`, update the versions in it, and point `compat` at a folder that compiles against it.

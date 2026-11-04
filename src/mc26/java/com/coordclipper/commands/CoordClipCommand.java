@@ -5,11 +5,11 @@ import com.coordclipper.modules.CoordClipSettings;
 import com.coordclipper.utils.Compat;
 import com.mojang.brigadier.builder.LiteralArgumentBuilder;
 import it.unimi.dsi.fastutil.longs.Long2DoubleOpenHashMap;
-import it.unimi.dsi.fastutil.longs.Long2BooleanOpenHashMap;
 import it.unimi.dsi.fastutil.longs.LongOpenHashSet;
+import it.unimi.dsi.fastutil.objects.Object2BooleanOpenHashMap;
+import it.unimi.dsi.fastutil.objects.ObjectOpenHashSet;
 import meteordevelopment.meteorclient.MeteorClient;
 import meteordevelopment.meteorclient.commands.Command;
-import meteordevelopment.meteorclient.commands.arguments.BlockPosArgumentType;
 import meteordevelopment.meteorclient.events.game.GameLeftEvent;
 import meteordevelopment.meteorclient.events.packets.PacketEvent;
 import meteordevelopment.meteorclient.events.world.TickEvent;
@@ -20,25 +20,26 @@ import meteordevelopment.meteorclient.utils.player.SlotUtils;
 import meteordevelopment.meteorclient.utils.world.BlockUtils;
 import meteordevelopment.meteorclient.utils.world.TickRate;
 import meteordevelopment.orbit.EventHandler;
-import net.minecraft.block.BlockState;
-import net.minecraft.block.Blocks;
-import net.minecraft.block.DoorBlock;
-import net.minecraft.client.network.PlayerListEntry;
-import net.minecraft.command.CommandSource;
-import net.minecraft.component.DataComponentTypes;
-import net.minecraft.entity.Entity;
-import net.minecraft.fluid.FluidState;
-import net.minecraft.item.BlockItem;
-import net.minecraft.item.ItemStack;
-import net.minecraft.network.packet.s2c.play.PlayerPositionLookS2CPacket;
-import net.minecraft.registry.tag.FluidTags;
-import net.minecraft.util.math.BlockPos;
-import net.minecraft.util.math.Box;
-import net.minecraft.util.math.Direction;
-import net.minecraft.util.math.MathHelper;
-import net.minecraft.util.math.Vec3d;
-import net.minecraft.util.shape.VoxelShape;
-import net.minecraft.world.Heightmap;
+import net.minecraft.world.level.block.state.BlockState;
+import net.minecraft.world.level.block.Blocks;
+import net.minecraft.world.level.block.DoorBlock;
+import net.minecraft.client.multiplayer.PlayerInfo;
+import net.minecraft.client.multiplayer.ClientSuggestionProvider;
+import net.minecraft.core.component.DataComponents;
+import net.minecraft.world.entity.Entity;
+import net.minecraft.world.entity.Pose;
+import net.minecraft.world.level.material.FluidState;
+import net.minecraft.world.item.BlockItem;
+import net.minecraft.world.item.ItemStack;
+import net.minecraft.network.protocol.game.ClientboundPlayerPositionPacket;
+import net.minecraft.tags.FluidTags;
+import net.minecraft.core.BlockPos;
+import net.minecraft.world.phys.AABB;
+import net.minecraft.core.Direction;
+import net.minecraft.util.Mth;
+import net.minecraft.world.phys.Vec3;
+import net.minecraft.world.phys.shapes.VoxelShape;
+import net.minecraft.world.level.levelgen.Heightmap;
 
 import java.util.ArrayDeque;
 import java.util.ArrayList;
@@ -48,6 +49,7 @@ import java.util.Deque;
 import java.util.List;
 import java.util.Locale;
 import java.util.PriorityQueue;
+import java.util.Set;
 import java.util.function.Predicate;
 
 /**
@@ -89,6 +91,10 @@ public class CoordClipCommand extends Command {
 
     private static final int RETRY_DELAY = 10;
     private static final int SEARCH_RETRY = 5;
+    // Longest it holds still in mid-air before dropping to the ground, well under the server's 80 tick floating kick
+    private static final int MAX_AIR_HOLD_TICKS = 40;
+    // Planned moves thrown away in a row that get logged, after that only the total is
+    private static final int LOGGED_DISCARDS = 5;
 
     // While the target is unloaded it aims for the farthest loaded point on the straight line to it, and every block
     // off that line counts as this many blocks further away, so it doesn't zigzag towards whichever chunks the server
@@ -107,30 +113,36 @@ public class CoordClipCommand extends Command {
 
     private enum Pause { NONE, BREATHING, PLACING_DOOR, EATING }
 
-    private record Move(int number, Vec3d from, Vec3d to, long time) {}
+    private record Move(int number, Vec3 from, Vec3 to, long time) {}
 
     // Planned moves not sent yet. Searches extend it from its end while it's being walked
-    private final Deque<Vec3d> hops = new ArrayDeque<>();
+    private final Deque<Vec3> hops = new ArrayDeque<>();
     // Sent moves recent enough that the server could still put us back for them
     private final Deque<Move> pending = new ArrayDeque<>();
     private final List<String> setbackCauses = new ArrayList<>();
     private Search search;
     // Feet height of the spot to stand on at each block position (NaN for none), shared between searches
     private final Long2DoubleOpenHashMap standCache = new Long2DoubleOpenHashMap();
-    // Whether the player can actually stand at each spot, shared between searches
-    private final Long2BooleanOpenHashMap spotCache = new Long2BooleanOpenHashMap();
+    // Whether the player can actually stand at each spot, shared between searches. Keyed by the exact position, since
+    // the player's hitbox can fit at one spot in a block and not at another
+    private final Object2BooleanOpenHashMap<Vec3> spotCache = new Object2BooleanOpenHashMap<>();
+    // Stops that a search planned but turned out to be impossible right before the move, never planned again
+    private final Set<Vec3> rejectedStops = new ObjectOpenHashSet<>();
     private int spotCacheAge;
     private BlockPos goal;
-    private Vec3d landing, last;
+    private Vec3 landing, last;
     // Where the clip started, the straight line from here to the target is the line it tries to stay on
-    private Vec3d origin;
+    private Vec3 origin;
     private boolean arriving;
     // Bumped whenever the planned route is thrown away, so searches planned from its old end get discarded
     private int planVersion;
     private int timer, searchCooldown, stallTicks, setbacks, moves, totalSetbacks;
+    // Watchdog: closest it has been to where it's going, and ticks since it got closer or last moved
+    private double bestRemaining;
+    private int noProgressTicks, ticksSinceMove, discards;
     private long startTime;
     // Where the server teleported us, set from the network thread
-    private volatile Vec3d serverTeleport;
+    private volatile Vec3 serverTeleport;
 
     private Pause pause = Pause.NONE;
     private int pauseTicks, eatSlot, prevSlot, breathRetry;
@@ -148,7 +160,7 @@ public class CoordClipCommand extends Command {
     }
 
     @Override
-    public void build(LiteralArgumentBuilder<CommandSource> builder) {
+    public void build(LiteralArgumentBuilder<ClientSuggestionProvider> builder) {
         builder.then(literal("stop").executes(context -> {
             if (goal == null) error("Not currently clipping.");
             else {
@@ -158,19 +170,22 @@ public class CoordClipCommand extends Command {
             return SINGLE_SUCCESS;
         }));
 
-        builder.then(argument("pos", BlockPosArgumentType.blockPos()).executes(context -> {
-            if (mc.player.hasVehicle()) {
+        builder.then(argument("pos", Compat.blockPosArgument()).executes(context -> {
+            if (mc.player.isPassenger()) {
                 error("Dismount first.");
                 return SINGLE_SUCCESS;
             }
 
             stop();
             readSettings();
-            goal = BlockPosArgumentType.getBlockPos(context, "pos");
+            goal = Compat.getBlockPos(context, "pos");
             landing = last = null;
             serverTeleport = null;
             arriving = false;
             timer = searchCooldown = stallTicks = setbacks = moves = totalSetbacks = 0;
+            noProgressTicks = ticksSinceMove = discards = 0;
+            bestRemaining = Double.MAX_VALUE;
+            rejectedStops.clear();
             pause = Pause.NONE;
             warnedNoAir = warnedNoFood = false;
             pending.clear();
@@ -180,7 +195,7 @@ public class CoordClipCommand extends Command {
             origin = Compat.pos(mc.player);
             MeteorClient.EVENT_BUS.subscribe(this);
 
-            double distance = Math.sqrt(goal.getSquaredDistance(Compat.pos(mc.player)));
+            double distance = Math.sqrt(goal.distToCenterSqr(Compat.pos(mc.player)));
             info("Clipping to (highlight)%d %d %d(default), (highlight)%.0f(default) blocks away.", goal.getX(), goal.getY(), goal.getZ(), distance);
             return SINGLE_SUCCESS;
         }));
@@ -210,12 +225,12 @@ public class CoordClipCommand extends Command {
 
     @EventHandler
     private void onTick(TickEvent.Pre event) {
-        if (mc.player.isDead()) {
+        if (mc.player.isDeadOrDying()) {
             failLogged("You died, stopped.", "Player died after %d moves, stopped.", moves);
             return;
         }
 
-        Vec3d teleport = serverTeleport;
+        Vec3 teleport = serverTeleport;
         if (teleport != null) {
             serverTeleport = null;
             onServerTeleport(teleport);
@@ -228,11 +243,14 @@ public class CoordClipCommand extends Command {
 
         // Hold still at the last stop, so we don't fall out of the air or sink in water between moves
         if (last != null) {
-            mc.player.setPosition(last);
-            mc.player.setVelocity(Vec3d.ZERO);
+            mc.player.setPos(last);
+            mc.player.setDeltaMovement(Vec3.ZERO);
         }
 
         if (tickSurvival()) return;
+
+        ticksSinceMove++;
+        if (checkStuck()) return;
 
         // Plan ahead while moving, so there's no pause to think at the end of each route
         advanceSearch();
@@ -252,10 +270,71 @@ public class CoordClipCommand extends Command {
         if (hops.isEmpty()) return;
 
         // Next move of the route, if it's still valid from where we actually are
-        Vec3d next = hops.poll();
-        Vec3d pos = Compat.pos(mc.player);
-        if (checkMove(pos, next)) move(pos, next);
-        else discardRoute();
+        Vec3 next = hops.poll();
+        Vec3 pos = Compat.pos(mc.player);
+        if (checkMove(pos, next)) {
+            discards = 0;
+            move(pos, next);
+        }
+        else {
+            // Don't plan the same impossible stop again, or it would plan it, reject it and plan it again forever
+            rejectedStops.add(next);
+            if (++discards <= LOGGED_DISCARDS) log("Planned move %s -> %s isn't possible (%s), planning again without it.", fmt(pos), fmt(next), whyNot(pos, next));
+            else if (discards == LOGGED_DISCARDS + 1) log("More planned moves aren't possible, not logging them.");
+            discardRoute();
+        }
+    }
+
+    /**
+     * Catches every way of getting stuck: drops to the ground if it's been hanging in mid-air too long, and gives up if
+     * it hasn't got any closer for the stuck timeout. Returns true if it did either.
+     */
+    private boolean checkStuck() {
+        Vec3 pos = Compat.pos(mc.player);
+
+        double remaining = remaining(pos);
+        if (remaining < bestRemaining - MIN_PROGRESS) {
+            bestRemaining = remaining;
+            noProgressTicks = 0;
+        }
+        // Exhaustive searches can take a while and give up on their own if there's no way
+        else if (!arriving && !(search != null && search.exhaustive)) noProgressTicks++;
+
+        if (noProgressTicks > stuckTimeout) {
+            CoordClipper.LOG.warn("[CoordClip] No progress for {} ticks at {}, {} blocks to go. Planned moves: {}, waiting for confirmation: {}, searching: {}, rejected stops: {}, setbacks: {}.",
+                noProgressTicks, fmt(pos), fmt(remaining), hops.size(), pending.size(), search != null, rejectedStops.size(), totalSetbacks);
+            fail(String.format(Locale.ROOT, "Didn't get any closer for %d seconds, stopped (highlight)%.0f(default) blocks away.", stuckTimeout / 20, remaining));
+            return true;
+        }
+
+        if (ticksSinceMove > MAX_AIR_HOLD_TICKS && pending.isEmpty() && !canWaitAt(pos)) {
+            Vec3 ground = findGroundBelow(pos);
+            if (ground != null) {
+                log("Held in mid-air at %s for %d ticks, dropping to the ground at %s.", fmt(pos), ticksSinceMove, fmt(ground));
+                discardRoute();
+                sendMove(pos, ground);
+                timer = moveDelay - 1;
+                return true;
+            }
+        }
+
+        return false;
+    }
+
+    /**
+     * How far it still has to go: to the landing spot once it's known, otherwise horizontally to the target.
+     */
+    private double remaining(Vec3 pos) {
+        if (landing != null) return pos.distanceTo(landing);
+        return horizontalDistance(pos, Vec3.atBottomCenterOf(goal));
+    }
+
+    private String whyNot(Vec3 from, Vec3 to) {
+        boolean vertical = unlimitedVertical && horizontalDistance(from, to) < 1.0E-3;
+        if (!vertical && from.distanceTo(to) > maxHopSent) return String.format(Locale.ROOT, "%.2f blocks, too far", from.distanceTo(to));
+        if (!canStop(to)) return "blocked by " + describeObstruction(to);
+        if (!canMove(from, to)) return "path blocked by " + describeBlocker(from, to);
+        return "unknown";
     }
 
     private void advanceSearch() {
@@ -280,7 +359,7 @@ public class CoordClipCommand extends Command {
     /**
      * Where the next search starts: the end of the planned route, or where we're standing.
      */
-    private Vec3d planEnd() {
+    private Vec3 planEnd() {
         if (!hops.isEmpty()) return hops.peekLast();
         return last != null ? last : Compat.pos(mc.player);
     }
@@ -310,9 +389,9 @@ public class CoordClipCommand extends Command {
         }
 
         // Don't hang in mid-air while stuck, the server kicks you for floating
-        Vec3d pos = Compat.pos(mc.player);
+        Vec3 pos = Compat.pos(mc.player);
         if (!canWaitAt(pos)) {
-            Vec3d ground = findGroundBelow(pos);
+            Vec3 ground = findGroundBelow(pos);
             if (ground != null) {
                 log("No route from mid-air at %s, dropping to the ground at %s.", fmt(pos), fmt(ground));
                 move(pos, ground);
@@ -338,15 +417,15 @@ public class CoordClipCommand extends Command {
     /**
      * The first spot to stand on straight below, reachable in one vertical clip.
      */
-    private Vec3d findGroundBelow(Vec3d pos) {
-        int x = MathHelper.floor(pos.x), z = MathHelper.floor(pos.z);
-        int minY = unlimitedVertical ? mc.world.getBottomY() : MathHelper.floor(pos.y - maxHop);
+    private Vec3 findGroundBelow(Vec3 pos) {
+        int x = Mth.floor(pos.x), z = Mth.floor(pos.z);
+        int minY = unlimitedVertical ? mc.level.getMinY() : Mth.floor(pos.y - maxHop);
 
-        for (int y = MathHelper.floor(pos.y); y >= minY; y--) {
+        for (int y = Mth.floor(pos.y); y >= minY; y--) {
             double standY = standHeight(x, y, z);
             if (Double.isNaN(standY) || standY > pos.y) continue;
 
-            Vec3d spot = new Vec3d(pos.x, standY, pos.z);
+            Vec3 spot = new Vec3(pos.x, standY, pos.z);
             if (standable(spot, true)) return spot;
         }
         return null;
@@ -382,7 +461,7 @@ public class CoordClipCommand extends Command {
      * Sorts out what a server teleport means: a resync at a move's destination is harmless, anything else is treated
      * as a setback and retried from wherever the server put us.
      */
-    private void onServerTeleport(Vec3d pos) {
+    private void onServerTeleport(Vec3 pos) {
         if (pending.isEmpty()) {
             // Servers resend the teleport until it's confirmed, so this is usually an already handled setback
             if (last == null || pos.distanceTo(last) < 0.5) {
@@ -412,7 +491,7 @@ public class CoordClipCommand extends Command {
         onSetBack(rejected, pending.peekLast().number - rejected.number, pos);
     }
 
-    private void onSetBack(Move move, int ignored, Vec3d pos) {
+    private void onSetBack(Move move, int ignored, Vec3 pos) {
         List<String> causes = diagnose(move, pos);
         String summary = String.join("; ", causes);
         setbackCauses.add("#" + move.number + ": " + summary);
@@ -427,7 +506,7 @@ public class CoordClipCommand extends Command {
         countSetback(pos, causes.getFirst());
     }
 
-    private void countSetback(Vec3d pos, String cause) {
+    private void countSetback(Vec3 pos, String cause) {
         totalSetbacks++;
         holdAndRetry(pos);
 
@@ -443,7 +522,7 @@ public class CoordClipCommand extends Command {
     /**
      * Throws the route away and holds still where the server has us, then plans again from there after a short delay.
      */
-    private void holdAndRetry(Vec3d pos) {
+    private void holdAndRetry(Vec3 pos) {
         discardRoute();
         pending.clear();
         arriving = false;
@@ -457,7 +536,7 @@ public class CoordClipCommand extends Command {
 
     @EventHandler
     private void onPacketReceive(PacketEvent.Receive event) {
-        if (event.packet instanceof PlayerPositionLookS2CPacket packet) {
+        if (event.packet instanceof ClientboundPlayerPositionPacket packet) {
             serverTeleport = Compat.teleportTarget(packet, mc.player);
         }
     }
@@ -479,6 +558,18 @@ public class CoordClipCommand extends Command {
     }
 
     private void fail(String chat) {
+        // Don't leave the player hanging in the air to fall once it lets go
+        if (!mc.player.isDeadOrDying()) {
+            Vec3 pos = Compat.pos(mc.player);
+            if (!canWaitAt(pos)) {
+                Vec3 ground = findGroundBelow(pos);
+                if (ground != null) {
+                    log("Stopping in mid-air at %s, dropping to the ground at %s first.", fmt(pos), fmt(ground));
+                    sendMove(pos, ground);
+                }
+            }
+        }
+
         stop();
         // Meteor formats chat messages again
         error(chat.replace("%", "%%"));
@@ -493,7 +584,7 @@ public class CoordClipCommand extends Command {
      * Same as Meteor's .hclip: only moves the player client side, the game sends the movement packet this tick.
      * Moves go out every {@code move-delay} ticks without waiting; setbacks are matched to them as they arrive.
      */
-    private void move(Vec3d from, Vec3d to) {
+    private void move(Vec3 from, Vec3 to) {
         sendMove(from, to);
 
         // Give the server a round trip to object to the final move before calling it done
@@ -504,11 +595,12 @@ public class CoordClipCommand extends Command {
         else timer = moveDelay - 1;
     }
 
-    private void sendMove(Vec3d from, Vec3d to) {
-        mc.player.setPosition(to);
-        mc.player.setVelocity(Vec3d.ZERO);
+    private void sendMove(Vec3 from, Vec3 to) {
+        mc.player.setPos(to);
+        mc.player.setDeltaMovement(Vec3.ZERO);
 
         last = to;
+        ticksSinceMove = 0;
         pending.addLast(new Move(++moves, from, to, System.currentTimeMillis()));
     }
 
@@ -516,15 +608,15 @@ public class CoordClipCommand extends Command {
      * Ticks to wait for a setback after the final move: one round trip plus a bit.
      */
     private int checkTicks() {
-        return MathHelper.clamp(MathHelper.ceil(ping() / 50.0) + 2, 3, 30);
+        return Mth.clamp(Mth.ceil(ping() / 50.0) + 2, 3, 30);
     }
 
     private int ping() {
-        PlayerListEntry entry = mc.getNetworkHandler().getPlayerListEntry(mc.player.getUuid());
+        PlayerInfo entry = mc.getConnection().getPlayerInfo(mc.player.getUUID());
         return entry == null ? 100 : entry.getLatency();
     }
 
-    private boolean checkMove(Vec3d from, Vec3d to) {
+    private boolean checkMove(Vec3 from, Vec3 to) {
         boolean vertical = unlimitedVertical && horizontalDistance(from, to) < 1.0E-3;
         return (vertical || from.distanceTo(to) <= maxHopSent) && canStop(to) && canMove(from, to);
     }
@@ -538,7 +630,7 @@ public class CoordClipCommand extends Command {
         switch (pause) {
             case BREATHING -> {
                 pauseTicks++;
-                if (mc.player.getAir() >= mc.player.getMaxAir()) {
+                if (mc.player.getAirSupply() >= mc.player.getMaxAirSupply()) {
                     info("Air refilled, continuing.");
                     endPause();
                     return false;
@@ -588,25 +680,25 @@ public class CoordClipCommand extends Command {
     }
 
     private boolean isLowOnAir() {
-        int threshold = mc.player.getMaxAir() * settings.airBubbles.get() / 10;
-        return mc.player.isSubmergedInWater() && mc.player.getAir() <= threshold;
+        int threshold = mc.player.getMaxAirSupply() * settings.airBubbles.get() / 10;
+        return mc.player.isUnderWater() && mc.player.getAirSupply() <= threshold;
     }
 
     private boolean isHungry() {
-        return !mc.player.getAbilities().creativeMode && mc.player.getHungerManager().getFoodLevel() <= settings.hungerBars.get() * 2;
+        return !mc.player.getAbilities().instabuild && mc.player.getFoodData().getFoodLevel() <= settings.hungerBars.get() * 2;
     }
 
     /**
      * Somewhere the player can be held for a while without the server kicking it for flying: on the ground or in water.
      */
-    private boolean canWaitAt(Vec3d feet) {
-        return standable(feet, true) || mc.world.getFluidState(BlockPos.ofFloored(feet)).isIn(FluidTags.WATER);
+    private boolean canWaitAt(Vec3 feet) {
+        return standable(feet, true) || mc.level.getFluidState(BlockPos.containing(feet)).is(FluidTags.WATER);
     }
 
     private boolean startBreathing() {
-        Vec3d from = Compat.pos(mc.player);
+        Vec3 from = Compat.pos(mc.player);
 
-        Vec3d spot = findBreathingSpot(from);
+        Vec3 spot = findBreathingSpot(from);
         if (spot != null) {
             discardRoute();
             if (spot.distanceTo(from) > 1.0E-3) sendMove(from, spot);
@@ -618,12 +710,12 @@ public class CoordClipCommand extends Command {
         }
 
         if (settings.useDoors.get() && hasDoor()) {
-            Vec3d floor = findDoorSpot(from);
+            Vec3 floor = findDoorSpot(from);
             if (floor != null) {
                 discardRoute();
                 pauseTicks = 0;
                 warnedNoAir = false;
-                doorPos = BlockPos.ofFloored(floor);
+                doorPos = BlockPos.containing(floor);
 
                 if (floor.distanceTo(from) > 1.0E-3) {
                     // Get to the floor first, the door goes in next tick once the server has us there
@@ -643,7 +735,7 @@ public class CoordClipCommand extends Command {
         if (!warnedNoAir) {
             warning("Low on air and there's no open air%s in reach, continuing.", settings.useDoors.get() ? " or room for a door" : "");
             CoordClipper.LOG.warn("[CoordClip] Low on air ({}/{}) at {}, no breathing spot within reach{}.",
-                mc.player.getAir(), mc.player.getMaxAir(), fmt(from), settings.useDoors.get() ? (hasDoor() ? " and no room for a door" : " and no door in the inventory") : "");
+                mc.player.getAirSupply(), mc.player.getMaxAirSupply(), fmt(from), settings.useDoors.get() ? (hasDoor() ? " and no room for a door" : " and no door in the inventory") : "");
             warnedNoAir = true;
         }
         return false;
@@ -653,11 +745,11 @@ public class CoordClipCommand extends Command {
      * The nearest spot within one move where the player's head is out of water and it can wait: floating at the water
      * surface or standing on dry ground. With unlimited vertical clips it also looks far up its own column.
      */
-    private Vec3d findBreathingSpot(Vec3d from) {
-        double eye = mc.player.getStandingEyeHeight();
-        int fx = MathHelper.floor(from.x), fy = MathHelper.floor(from.y), fz = MathHelper.floor(from.z);
-        BlockPos.Mutable pos = new BlockPos.Mutable();
-        Vec3d best = null;
+    private Vec3 findBreathingSpot(Vec3 from) {
+        double eye = mc.player.getEyeHeight(Pose.STANDING);
+        int fx = Mth.floor(from.x), fy = Mth.floor(from.y), fz = Mth.floor(from.z);
+        BlockPos.MutableBlockPos pos = new BlockPos.MutableBlockPos();
+        Vec3 best = null;
         double bestDist = Double.MAX_VALUE;
 
         for (int dx = -reach; dx <= reach; dx++) {
@@ -668,16 +760,16 @@ public class CoordClipCommand extends Command {
 
                 int up = ownColumn && unlimitedVertical ? BREATH_SEARCH_UP : reach;
                 for (int y = fy - reach; y <= fy + up; y++) {
-                    Vec3d spot = ownColumn ? new Vec3d(from.x, y, from.z) : new Vec3d(x + 0.5, y, z + 0.5);
+                    Vec3 spot = ownColumn ? new Vec3(from.x, y, from.z) : new Vec3(x + 0.5, y, z + 0.5);
                     double dist = spot.distanceTo(from);
                     if (dist >= bestDist || (!(ownColumn && unlimitedVertical) && dist > maxHop)) continue;
 
                     // Cheap checks first: head out of water, feet not inside a block
-                    pos.set(x, MathHelper.floor(y + eye), z);
-                    BlockState head = mc.world.getBlockState(pos);
-                    if (!head.getFluidState().isEmpty() || !head.getCollisionShape(mc.world, pos).isEmpty()) continue;
+                    pos.set(x, Mth.floor(y + eye), z);
+                    BlockState head = mc.level.getBlockState(pos);
+                    if (!head.getFluidState().isEmpty() || !head.getCollisionShape(mc.level, pos).isEmpty()) continue;
                     pos.set(x, y, z);
-                    if (!mc.world.getBlockState(pos).getCollisionShape(mc.world, pos).isEmpty()) continue;
+                    if (!mc.level.getBlockState(pos).getCollisionShape(mc.level, pos).isEmpty()) continue;
 
                     if (!canWaitAt(spot) || !canStop(spot) || !canMove(from, spot)) continue;
                     best = spot;
@@ -698,23 +790,23 @@ public class CoordClipCommand extends Command {
     /**
      * Where to put a door: the player's own column, on a floor with two blocks of water above it.
      */
-    private Vec3d findDoorSpot(Vec3d from) {
+    private Vec3 findDoorSpot(Vec3 from) {
         int down = unlimitedVertical ? BREATH_SEARCH_UP : reach;
-        BlockPos.Mutable pos = new BlockPos.Mutable();
+        BlockPos.MutableBlockPos pos = new BlockPos.MutableBlockPos();
 
-        for (int y = MathHelper.floor(from.y); y >= MathHelper.floor(from.y) - down; y--) {
-            pos.set(MathHelper.floor(from.x), y, MathHelper.floor(from.z));
-            if (mc.world.isOutOfHeightLimit(pos.down())) break;
+        for (int y = Mth.floor(from.y); y >= Mth.floor(from.y) - down; y--) {
+            pos.set(Mth.floor(from.x), y, Mth.floor(from.z));
+            if (mc.level.isOutsideBuildHeight(pos.below())) break;
 
-            BlockState below = mc.world.getBlockState(pos.down());
-            if (!below.isSideSolidFullSquare(mc.world, pos.down(), Direction.UP)) {
+            BlockState below = mc.level.getBlockState(pos.below());
+            if (!below.isFaceSturdy(mc.level, pos.below(), Direction.UP)) {
                 // Can't see through a floor, stop at the first solid one
-                if (!below.getCollisionShape(mc.world, pos.down()).isEmpty()) break;
+                if (!below.getCollisionShape(mc.level, pos.below()).isEmpty()) break;
                 continue;
             }
 
-            if (!mc.world.getBlockState(pos).isReplaceable() || !mc.world.getBlockState(pos.up()).isReplaceable()) return null;
-            Vec3d spot = new Vec3d(from.x, y, from.z);
+            if (!mc.level.getBlockState(pos).canBeReplaced() || !mc.level.getBlockState(pos.above()).canBeReplaced()) return null;
+            Vec3 spot = new Vec3(from.x, y, from.z);
             return canMove(from, spot) ? spot : null;
         }
 
@@ -767,7 +859,7 @@ public class CoordClipCommand extends Command {
     private boolean tickEating() {
         pauseTicks++;
 
-        int food = mc.player.getHungerManager().getFoodLevel();
+        int food = mc.player.getFoodData().getFoodLevel();
         if (food >= settings.eatUntil.get() * 2 || pauseTicks > MAX_EATING_TICKS) {
             stopEating();
             info("Done eating, continuing.");
@@ -776,7 +868,7 @@ public class CoordClipCommand extends Command {
         }
 
         // Ran out of this food, switch to the next one
-        if (!isFood(mc.player.getInventory().getStack(eatSlot))) {
+        if (!isFood(mc.player.getInventory().getItem(eatSlot))) {
             int slot = findFood();
             if (slot == -1 || !selectFood(slot)) {
                 stopEating();
@@ -791,18 +883,18 @@ public class CoordClipCommand extends Command {
             }
         }
 
-        mc.options.useKey.setPressed(true);
+        mc.options.keyUse.setDown(true);
         if (!mc.player.isUsingItem()) Utils.rightClick();
         return true;
     }
 
     private void stopEating() {
-        mc.options.useKey.setPressed(false);
+        mc.options.keyUse.setDown(false);
         if (prevSlot >= SlotUtils.HOTBAR_START && prevSlot <= SlotUtils.HOTBAR_END) InvUtils.swap(prevSlot, false);
     }
 
     private boolean isFood(ItemStack stack) {
-        return stack.get(DataComponentTypes.FOOD) != null && !settings.foodBlacklist.get().contains(stack.getItem());
+        return stack.get(DataComponents.FOOD) != null && !settings.foodBlacklist.get().contains(stack.getItem());
     }
 
     /**
@@ -834,7 +926,7 @@ public class CoordClipCommand extends Command {
     /**
      * Best guesses for why the server put us back, most likely first. Mirrors the server's movement checks.
      */
-    private List<String> diagnose(Move move, Vec3d serverPos) {
+    private List<String> diagnose(Move move, Vec3 serverPos) {
         List<String> causes = new ArrayList<>();
         double distance = move.from.distanceTo(move.to);
         boolean vertical = horizontalDistance(move.from, move.to) < 1.0E-3;
@@ -875,14 +967,14 @@ public class CoordClipCommand extends Command {
     /**
      * What's in the way of a move's horizontal part, which the server replays at the height the vertical part ended.
      */
-    private String describeBlocker(Vec3d from, Vec3d to) {
-        Vec3d delta = to.subtract(from);
-        Vec3d moved = Entity.adjustMovementForCollisions(mc.player, delta, hitboxAt(from), mc.world, List.of());
-        Box base = hitboxAt(from).offset(0, moved.y, 0);
+    private String describeBlocker(Vec3 from, Vec3 to) {
+        Vec3 delta = to.subtract(from);
+        Vec3 moved = Entity.collideBoundingBox(mc.player, delta, hitboxAt(from), mc.level, List.of());
+        AABB base = hitboxAt(from).move(0, moved.y, 0);
 
-        int steps = Math.max(1, MathHelper.ceil(horizontalDistance(from, to) / 0.25));
+        int steps = Math.max(1, Mth.ceil(horizontalDistance(from, to) / 0.25));
         for (int i = 1; i <= steps; i++) {
-            Box box = base.offset(delta.x * i / steps, 0, delta.z * i / steps);
+            AABB box = base.move(delta.x * i / steps, 0, delta.z * i / steps);
             String block = collidingBlock(box);
             if (block != null) return block;
         }
@@ -890,39 +982,39 @@ public class CoordClipCommand extends Command {
         return "an entity or the world border";
     }
 
-    private String describeObstruction(Vec3d feet) {
-        Box box = hitboxAt(feet);
-        if (!isLoaded(MathHelper.floor(feet.x), MathHelper.floor(feet.z))) return "an unloaded chunk";
+    private String describeObstruction(Vec3 feet) {
+        AABB box = hitboxAt(feet);
+        if (!isLoaded(Mth.floor(feet.x), Mth.floor(feet.z))) return "an unloaded chunk";
 
         String block = collidingBlock(box);
         if (block != null) return block;
 
         for (BlockPos pos : blocksIn(box)) {
-            BlockState state = mc.world.getBlockState(pos);
-            if (state.getFluidState().isIn(FluidTags.LAVA) || isDangerous(state)) return describe(state, pos);
+            BlockState state = mc.level.getBlockState(pos);
+            if (state.getFluidState().is(FluidTags.LAVA) || isDangerous(state)) return describe(state, pos);
         }
 
-        for (Entity entity : mc.world.getOtherEntities(mc.player, box)) {
-            if (entity.isCollidable(mc.player)) return entity.getName().getString() + " at " + fmt(Compat.pos(entity));
+        for (Entity entity : mc.level.getEntities(mc.player, box)) {
+            if (Compat.collides(entity, mc.player)) return entity.getName().getString() + " at " + fmt(Compat.pos(entity));
         }
 
         return "the world border or an entity";
     }
 
-    private String collidingBlock(Box box) {
+    private String collidingBlock(AABB box) {
         for (BlockPos pos : blocksIn(box)) {
-            BlockState state = mc.world.getBlockState(pos);
-            for (Box shape : state.getCollisionShape(mc.world, pos).getBoundingBoxes()) {
-                if (shape.offset(pos).intersects(box)) return describe(state, pos);
+            BlockState state = mc.level.getBlockState(pos);
+            for (AABB shape : state.getCollisionShape(mc.level, pos).toAabbs()) {
+                if (shape.move(pos).intersects(box)) return describe(state, pos);
             }
         }
         return null;
     }
 
-    private static Iterable<BlockPos> blocksIn(Box box) {
-        return BlockPos.iterate(
-            MathHelper.floor(box.minX), MathHelper.floor(box.minY), MathHelper.floor(box.minZ),
-            MathHelper.floor(box.maxX), MathHelper.floor(box.maxY), MathHelper.floor(box.maxZ)
+    private static Iterable<BlockPos> blocksIn(AABB box) {
+        return BlockPos.betweenClosed(
+            Mth.floor(box.minX), Mth.floor(box.minY), Mth.floor(box.minZ),
+            Mth.floor(box.maxX), Mth.floor(box.maxY), Mth.floor(box.maxZ)
         );
     }
 
@@ -934,7 +1026,7 @@ public class CoordClipCommand extends Command {
         CoordClipper.LOG.info("[CoordClip] {}", String.format(Locale.ROOT, message, args));
     }
 
-    private static String fmt(Vec3d vec) {
+    private static String fmt(Vec3 vec) {
         return String.format(Locale.ROOT, "%.2f %.2f %.2f", vec.x, vec.y, vec.z);
     }
 
@@ -949,9 +1041,9 @@ public class CoordClipCommand extends Command {
      * loaded point on the line to the target. It's exhaustive when close to the landing spot or when
      * {@code exhaustive} is set. Returns null if there's nothing to search for yet.
      */
-    private Search newSearch(Vec3d pos, boolean exhaustive) {
+    private Search newSearch(Vec3 pos, boolean exhaustive) {
         if (!isLoaded(goal.getX(), goal.getZ())) {
-            Vec3d waypoint = farthestLoadedOnLine(pos);
+            Vec3 waypoint = farthestLoadedOnLine(pos);
             if (horizontalDistance(pos, waypoint) >= MIN_SEGMENT) return new Search(pos, waypoint, null, exhaustive);
 
             // Not enough of the line is loaded yet, wait for the server to send more chunks
@@ -974,36 +1066,38 @@ public class CoordClipCommand extends Command {
             }
 
             info("Landing at (highlight)%.0f %.1f %.0f(default).", Math.floor(landing.x), landing.y, Math.floor(landing.z));
+            // Progress is measured to the landing spot from now on
+            bestRemaining = Double.MAX_VALUE;
         }
 
         exhaustive |= pos.distanceTo(landing) <= EXHAUSTIVE_RANGE;
-        return new Search(pos, landing, BlockPos.ofFloored(landing), exhaustive);
+        return new Search(pos, landing, BlockPos.containing(landing), exhaustive);
     }
 
     /**
      * The farthest point on the straight line from where the clip started to the target that's loaded all the way
      * from {@code pos}'s spot on the line.
      */
-    private Vec3d farthestLoadedOnLine(Vec3d pos) {
+    private Vec3 farthestLoadedOnLine(Vec3 pos) {
         double lx = goal.getX() + 0.5 - origin.x, lz = goal.getZ() + 0.5 - origin.z;
         double length = Math.sqrt(lx * lx + lz * lz);
         if (length < 1.0E-6) return pos;
         double ux = lx / length, uz = lz / length;
 
-        double t = MathHelper.clamp((pos.x - origin.x) * ux + (pos.z - origin.z) * uz, 0, length);
+        double t = Mth.clamp((pos.x - origin.x) * ux + (pos.z - origin.z) * uz, 0, length);
         double loaded = t;
         for (double d = t + LINE_SCAN_STEP; d <= length; d += LINE_SCAN_STEP) {
-            if (!isLoaded(MathHelper.floor(origin.x + ux * d), MathHelper.floor(origin.z + uz * d))) break;
+            if (!isLoaded(Mth.floor(origin.x + ux * d), Mth.floor(origin.z + uz * d))) break;
             loaded = d;
         }
 
-        return new Vec3d(origin.x + ux * loaded, pos.y, origin.z + uz * loaded);
+        return new Vec3(origin.x + ux * loaded, pos.y, origin.z + uz * loaded);
     }
 
     /**
      * Horizontal distance from the straight line between where the clip started and the target.
      */
-    private double distanceFromLine(Vec3d vec) {
+    private double distanceFromLine(Vec3 vec) {
         double lx = goal.getX() + 0.5 - origin.x, lz = goal.getZ() + 0.5 - origin.z;
         double length = Math.sqrt(lx * lx + lz * lz);
         if (length < 1.0E-6) return 0;
@@ -1013,7 +1107,7 @@ public class CoordClipCommand extends Command {
 
     private static class Node {
         final BlockPos pos;
-        final Vec3d vec;
+        final Vec3 vec;
         final Node parent;
         final double g;
         // Number of stops in a row in the air, 0 when standing on something
@@ -1022,7 +1116,7 @@ public class CoordClipCommand extends Command {
         final boolean verified;
         final double h, f;
 
-        Node(BlockPos pos, Vec3d vec, Node parent, double g, int airChain, boolean verified, double h, double weight) {
+        Node(BlockPos pos, Vec3 vec, Node parent, double g, int airChain, boolean verified, double h, double weight) {
             this.pos = pos;
             this.vec = vec;
             this.parent = parent;
@@ -1051,7 +1145,7 @@ public class CoordClipCommand extends Command {
      * down. When exhaustive it isn't weighted (so the route found is the shortest) and doesn't give up early.
      */
     private class Search {
-        final Vec3d goalVec;
+        final Vec3 goalVec;
         final BlockPos target;
         final boolean exhaustive;
         final double weight;
@@ -1064,29 +1158,29 @@ public class CoordClipCommand extends Command {
         final LongOpenHashSet closed = new LongOpenHashSet();
         // Columns whose spots have already been added as vertical clips
         final LongOpenHashSet scannedColumns = new LongOpenHashSet();
-        final BlockPos.Mutable mutable = new BlockPos.Mutable();
+        final BlockPos.MutableBlockPos mutable = new BlockPos.MutableBlockPos();
 
         final Node start;
         Node closest;
         int expansions, staleExpansions;
-        List<Vec3d> result;
+        List<Vec3> result;
 
-        Search(Vec3d from, Vec3d goalVec, BlockPos target, boolean exhaustive) {
+        Search(Vec3 from, Vec3 goalVec, BlockPos target, boolean exhaustive) {
             this.goalVec = goalVec;
             this.target = target;
             this.exhaustive = exhaustive;
             this.weight = exhaustive ? 1 : HEURISTIC_WEIGHT;
             this.maxExpansions = exhaustive ? MAX_EXHAUSTIVE_EXPANSIONS : MAX_EXPANSIONS;
-            this.bottomY = mc.world.getBottomY();
-            this.topY = bottomY + mc.world.getHeight();
+            this.bottomY = mc.level.getMinY();
+            this.topY = bottomY + mc.level.getHeight();
             bestG.defaultReturnValue(Double.MAX_VALUE);
 
-            start = new Node(BlockPos.ofFloored(from), from, null, 0, 0, true, heuristic(from), weight);
+            start = new Node(BlockPos.containing(from), from, null, 0, 0, true, heuristic(from), weight);
             closest = start;
             open.add(start);
         }
 
-        double heuristic(Vec3d vec) {
+        double heuristic(Vec3 vec) {
             if (target == null) {
                 // Until we know where we're landing only the horizontal distance matters, plus how far off the line we are
                 return (horizontalDistance(vec, goalVec) + LINE_DEVIATION_WEIGHT * distanceFromLine(vec)) / maxHop;
@@ -1139,8 +1233,9 @@ public class CoordClipCommand extends Command {
             return false;
         }
 
-        void add(Vec3d vec, Node parent, int airChain, boolean verified) {
-            BlockPos pos = BlockPos.ofFloored(vec);
+        void add(Vec3 vec, Node parent, int airChain, boolean verified) {
+            if (rejectedStops.contains(vec)) return;
+            BlockPos pos = BlockPos.containing(vec);
             long key = pos.asLong();
             double g = parent.g + 1 + (airChain > 0 ? AIR_STOP_COST : 0);
             if (bestG.get(key) <= g || closed.contains(key)) return;
@@ -1151,7 +1246,7 @@ public class CoordClipCommand extends Command {
 
         void expand(Node node) {
             double vx = node.vec.x, vy = node.vec.y, vz = node.vec.z;
-            int nx = MathHelper.floor(vx), nz = MathHelper.floor(vz);
+            int nx = Mth.floor(vx), nz = Mth.floor(vz);
 
             // Ground spots within one move. Only the column's y range that's in reach is checked
             for (int dx = -reach; dx <= reach; dx++) {
@@ -1165,15 +1260,15 @@ public class CoordClipCommand extends Command {
                     if (horizontalSq > maxHopSq || horizontalSq < 1.0E-6 || !isLoaded(x, z)) continue;
 
                     double dyMax = Math.sqrt(maxHopSq - horizontalSq);
-                    int minY = Math.max(bottomY, MathHelper.floor(vy - dyMax) - 1);
-                    int maxY = Math.min(topY - 1, MathHelper.floor(vy + dyMax));
+                    int minY = Math.max(bottomY, Mth.floor(vy - dyMax) - 1);
+                    int maxY = Math.min(topY - 1, Mth.floor(vy + dyMax));
 
                     for (int y = minY; y <= maxY; y++) {
                         double standY = standHeight(x, y, z);
                         if (Double.isNaN(standY)) continue;
 
-                        Vec3d vec = new Vec3d(x + 0.5, standY, z + 0.5);
-                        if (node.vec.squaredDistanceTo(vec) > maxHopSq) continue;
+                        Vec3 vec = new Vec3(x + 0.5, standY, z + 0.5);
+                        if (node.vec.distanceToSqr(vec) > maxHopSq) continue;
                         if (exhaustive && (!isSpot(vec) || !canMove(node.vec, vec))) continue;
                         add(vec, node, 0, exhaustive);
                     }
@@ -1190,7 +1285,7 @@ public class CoordClipCommand extends Command {
          */
         void verticalClips(Node node) {
             double vy = node.vec.y;
-            int x = MathHelper.floor(node.vec.x), z = MathHelper.floor(node.vec.z);
+            int x = Mth.floor(node.vec.x), z = Mth.floor(node.vec.z);
 
             int minY, maxY;
             // Whole columns near the target, when stuck, and to get down from the air; long trips stay fast
@@ -1201,8 +1296,8 @@ public class CoordClipCommand extends Command {
                 maxY = topY - 1;
             }
             else {
-                minY = Math.max(bottomY, MathHelper.floor(vy - maxHop) - 1);
-                maxY = Math.min(topY - 1, MathHelper.floor(vy + maxHop));
+                minY = Math.max(bottomY, Mth.floor(vy - maxHop) - 1);
+                maxY = Math.min(topY - 1, Mth.floor(vy + maxHop));
             }
 
             for (int y = minY; y <= maxY; y++) {
@@ -1211,7 +1306,7 @@ public class CoordClipCommand extends Command {
                 if (!wholeColumn && Math.abs(standY - vy) > maxHop) continue;
 
                 // Exactly above or below, so the move is a pure vclip
-                Vec3d vec = new Vec3d(node.vec.x, standY, node.vec.z);
+                Vec3 vec = new Vec3(node.vec.x, standY, node.vec.z);
                 add(vec, node, 0, false);
             }
         }
@@ -1236,27 +1331,27 @@ public class CoordClipCommand extends Command {
 
             for (double y : heights) {
                 if (y < bottomY || y > topY + 2 || Math.abs(y - node.vec.y) < 0.5) continue;
-                Vec3d vec = new Vec3d(node.vec.x, y, node.vec.z);
+                Vec3 vec = new Vec3(node.vec.x, y, node.vec.z);
                 if (canStop(vec)) add(vec, node, isSpot(vec) ? 0 : chain, true);
             }
 
             // Across at the same height, but only from a stop that's already in the air
             if (node.airChain == 0) return;
 
-            List<Vec3d> moves = new ArrayList<>();
-            for (double[] dir : AIR_DIRECTIONS) moves.add(new Vec3d(dir[0] * maxHop, 0, dir[1] * maxHop));
+            List<Vec3> moves = new ArrayList<>();
+            for (double[] dir : AIR_DIRECTIONS) moves.add(new Vec3(dir[0] * maxHop, 0, dir[1] * maxHop));
 
             // Straight towards the goal, stopping right above it if it's in reach
             double gx = goalVec.x - node.vec.x, gz = goalVec.z - node.vec.z;
             double gl = Math.sqrt(gx * gx + gz * gz);
             if (gl > 1.0E-3) {
                 double length = Math.min(maxHop, gl);
-                moves.add(new Vec3d(gx / gl * length, 0, gz / gl * length));
+                moves.add(new Vec3(gx / gl * length, 0, gz / gl * length));
             }
 
-            for (Vec3d offset : moves) {
-                Vec3d vec = node.vec.add(offset);
-                if (!isLoaded(MathHelper.floor(vec.x), MathHelper.floor(vec.z)) || !canStop(vec) || !canMove(node.vec, vec)) continue;
+            for (Vec3 offset : moves) {
+                Vec3 vec = node.vec.add(offset);
+                if (!isLoaded(Mth.floor(vec.x), Mth.floor(vec.z)) || !canStop(vec) || !canMove(node.vec, vec)) continue;
                 add(vec, node, isSpot(vec) ? 0 : chain, true);
             }
         }
@@ -1264,14 +1359,14 @@ public class CoordClipCommand extends Command {
         /**
          * A height in the node's column above every block within one move, so moves across at that height are clear.
          */
-        double clearHeight(Vec3d vec) {
-            int x0 = MathHelper.floor(vec.x), z0 = MathHelper.floor(vec.z);
-            int top = MathHelper.floor(vec.y);
+        double clearHeight(Vec3 vec) {
+            int x0 = Mth.floor(vec.x), z0 = Mth.floor(vec.z);
+            int top = Mth.floor(vec.y);
 
             for (int dx = -reach; dx <= reach; dx++) {
                 for (int dz = -reach; dz <= reach; dz++) {
                     if (dx * dx + dz * dz > maxHopSq || !isLoaded(x0 + dx, z0 + dz)) continue;
-                    top = Math.max(top, mc.world.getTopY(Heightmap.Type.MOTION_BLOCKING, x0 + dx, z0 + dz));
+                    top = Math.max(top, mc.level.getHeight(Heightmap.Types.MOTION_BLOCKING, x0 + dx, z0 + dz));
                 }
             }
 
@@ -1293,11 +1388,11 @@ public class CoordClipCommand extends Command {
      * with collisions, vertically first, and puts you back if the horizontal part didn't get where you said. The
      * vertical part is never checked, so only the horizontal part has to be clear. {@code to} itself has to be free.
      */
-    private boolean canMove(Vec3d from, Vec3d to) {
-        Vec3d delta = to.subtract(from);
+    private boolean canMove(Vec3 from, Vec3 to) {
+        Vec3 delta = to.subtract(from);
         if (delta.x * delta.x + delta.z * delta.z < 1.0E-6) return true;
 
-        Vec3d moved = Entity.adjustMovementForCollisions(mc.player, delta, hitboxAt(from), mc.world, List.of());
+        Vec3 moved = Entity.collideBoundingBox(mc.player, delta, hitboxAt(from), mc.level, List.of());
         double ex = delta.x - moved.x, ez = delta.z - moved.z;
         return ex * ex + ez * ez <= MAX_HORIZONTAL_ERROR_SQ;
     }
@@ -1306,23 +1401,22 @@ public class CoordClipCommand extends Command {
      * Whether the player can be held at this position for a moment: the landing spot, or anywhere the player fits
      * (water is fine) without touching anything that hurts. Used to recheck a move right before it's sent.
      */
-    private boolean canStop(Vec3d feet) {
+    private boolean canStop(Vec3 feet) {
         if (feet.equals(landing)) return standable(feet, false);
-        return fits(feet, true) && mc.world.getStatesInBox(hitboxAt(feet)).noneMatch(CoordClipCommand::isDangerous);
+        return fits(feet, true) && mc.level.getBlockStates(hitboxAt(feet)).noneMatch(CoordClipCommand::isDangerous);
     }
 
     /**
      * Whether the player can stand at this spot on the way (water is fine), cached for a few seconds. The landing spot
      * has to be dry.
      */
-    private boolean isSpot(Vec3d feet) {
+    private boolean isSpot(Vec3 feet) {
         if (feet.equals(landing)) return standable(feet, false);
 
-        long key = BlockPos.ofFloored(feet).asLong();
-        if (spotCache.containsKey(key)) return spotCache.get(key);
+        if (spotCache.containsKey(feet)) return spotCache.getBoolean(feet);
 
         boolean spot = standable(feet, true);
-        spotCache.put(key, spot);
+        spotCache.put(feet, spot);
         return spot;
     }
 
@@ -1342,23 +1436,23 @@ public class CoordClipCommand extends Command {
 
     private double computeStandHeight(int x, int y, int z) {
         BlockPos pos = new BlockPos(x, y, z);
-        if (mc.world.isOutOfHeightLimit(pos.down())) return Double.NaN;
+        if (mc.level.isOutsideBuildHeight(pos.below())) return Double.NaN;
 
-        BlockState feet = mc.world.getBlockState(pos);
-        if (feet.getFluidState().isIn(FluidTags.LAVA)) return Double.NaN;
+        BlockState feet = mc.level.getBlockState(pos);
+        if (feet.getFluidState().is(FluidTags.LAVA)) return Double.NaN;
 
-        VoxelShape feetShape = feet.getCollisionShape(mc.world, pos);
+        VoxelShape feetShape = feet.getCollisionShape(mc.level, pos);
         if (!feetShape.isEmpty()) {
-            double top = feetShape.getMax(Direction.Axis.Y);
+            double top = feetShape.max(Direction.Axis.Y);
             return top > 0 && top < 1 ? y + top : Double.NaN;
         }
 
-        BlockPos below = pos.down();
-        VoxelShape belowShape = mc.world.getBlockState(below).getCollisionShape(mc.world, below);
+        BlockPos below = pos.below();
+        VoxelShape belowShape = mc.level.getBlockState(below).getCollisionShape(mc.level, below);
         if (belowShape.isEmpty()) return Double.NaN;
 
         // Partial blocks below are handled as their own position
-        double top = belowShape.getMax(Direction.Axis.Y);
+        double top = belowShape.max(Direction.Axis.Y);
         return top >= 1 ? below.getY() + top : Double.NaN;
     }
 
@@ -1366,9 +1460,9 @@ public class CoordClipCommand extends Command {
      * Nearest spot to {@code center} where the player fits and stands on solid ground, out of water, searching
      * outwards in cubic shells until no closer spot is possible.
      */
-    private Vec3d findLanding(BlockPos center) {
-        Vec3d wanted = Vec3d.ofBottomCenter(center);
-        Vec3d best = null;
+    private Vec3 findLanding(BlockPos center) {
+        Vec3 wanted = Vec3.atBottomCenterOf(center);
+        Vec3 best = null;
         double bestDist = Double.MAX_VALUE;
 
         for (int r = 0; r <= landingRadius; r++) {
@@ -1385,8 +1479,8 @@ public class CoordClipCommand extends Command {
                         double standY = standHeight(px, py, pz);
                         if (Double.isNaN(standY)) continue;
 
-                        Vec3d spot = new Vec3d(px + 0.5, standY, pz + 0.5);
-                        double dist = spot.squaredDistanceTo(wanted);
+                        Vec3 spot = new Vec3(px + 0.5, standY, pz + 0.5);
+                        double dist = spot.distanceToSqr(wanted);
                         if (dist < bestDist && standable(spot, false)) {
                             best = spot;
                             bestDist = dist;
@@ -1403,53 +1497,53 @@ public class CoordClipCommand extends Command {
      * Whether the player fits at the given feet position, has solid ground directly underneath, and isn't standing in
      * or on anything that hurts.
      */
-    private boolean standable(Vec3d feet, boolean allowWater) {
+    private boolean standable(Vec3 feet, boolean allowWater) {
         if (!fits(feet, allowWater)) return false;
 
-        Box box = hitboxAt(feet);
-        Box ground = new Box(box.minX, box.minY - 0.05, box.minZ, box.maxX, box.minY, box.maxZ);
-        if (mc.world.isSpaceEmpty(mc.player, ground)) return false;
+        AABB box = hitboxAt(feet);
+        AABB ground = new AABB(box.minX, box.minY - 0.05, box.minZ, box.maxX, box.minY, box.maxZ);
+        if (mc.level.noCollision(mc.player, ground)) return false;
 
-        return mc.world.getStatesInBox(box.union(ground)).noneMatch(CoordClipCommand::isDangerous);
+        return mc.level.getBlockStates(box.minmax(ground)).noneMatch(CoordClipCommand::isDangerous);
     }
 
     private static boolean isDangerous(BlockState state) {
-        return state.isOf(Blocks.FIRE) || state.isOf(Blocks.SOUL_FIRE) || state.isOf(Blocks.MAGMA_BLOCK)
-            || state.isOf(Blocks.CAMPFIRE) || state.isOf(Blocks.SOUL_CAMPFIRE) || state.isOf(Blocks.CACTUS)
-            || state.isOf(Blocks.SWEET_BERRY_BUSH) || state.isOf(Blocks.WITHER_ROSE) || state.isOf(Blocks.COBWEB)
-            || state.isOf(Blocks.POWDER_SNOW) || state.getFluidState().isIn(FluidTags.LAVA);
+        return state.is(Blocks.FIRE) || state.is(Blocks.SOUL_FIRE) || state.is(Blocks.MAGMA_BLOCK)
+            || state.is(Blocks.CAMPFIRE) || state.is(Blocks.SOUL_CAMPFIRE) || state.is(Blocks.CACTUS)
+            || state.is(Blocks.SWEET_BERRY_BUSH) || state.is(Blocks.WITHER_ROSE) || state.is(Blocks.COBWEB)
+            || state.is(Blocks.POWDER_SNOW) || state.getFluidState().is(FluidTags.LAVA);
     }
 
     /**
      * Whether the player's hitbox fits at the given feet position without touching blocks, entities or fluids
      * (other than water, if allowed). Unloaded chunks never fit, since the client doesn't know what's there.
      */
-    private boolean fits(Vec3d feet, boolean allowWater) {
-        Box box = hitboxAt(feet);
+    private boolean fits(Vec3 feet, boolean allowWater) {
+        AABB box = hitboxAt(feet);
 
-        int minX = MathHelper.floor(box.minX) >> 4, maxX = MathHelper.floor(box.maxX) >> 4;
-        int minZ = MathHelper.floor(box.minZ) >> 4, maxZ = MathHelper.floor(box.maxZ) >> 4;
+        int minX = Mth.floor(box.minX) >> 4, maxX = Mth.floor(box.maxX) >> 4;
+        int minZ = Mth.floor(box.minZ) >> 4, maxZ = Mth.floor(box.maxZ) >> 4;
         for (int cx = minX; cx <= maxX; cx++) {
             for (int cz = minZ; cz <= maxZ; cz++) {
-                if (!mc.world.getChunkManager().isChunkLoaded(cx, cz)) return false;
+                if (!mc.level.getChunkSource().hasChunk(cx, cz)) return false;
             }
         }
 
-        return mc.world.isSpaceEmpty(mc.player, box) && mc.world.getStatesInBox(box).allMatch(state -> {
+        return mc.level.noCollision(mc.player, box) && mc.level.getBlockStates(box).allMatch(state -> {
             FluidState fluid = state.getFluidState();
-            return fluid.isEmpty() || (allowWater && fluid.isIn(FluidTags.WATER));
+            return fluid.isEmpty() || (allowWater && fluid.is(FluidTags.WATER));
         });
     }
 
-    private Box hitboxAt(Vec3d feet) {
-        return mc.player.getBoundingBox().offset(feet.subtract(Compat.pos(mc.player)));
+    private AABB hitboxAt(Vec3 feet) {
+        return mc.player.getBoundingBox().move(feet.subtract(Compat.pos(mc.player)));
     }
 
-    private static double horizontalDistance(Vec3d a, Vec3d b) {
-        return Math.sqrt(MathHelper.square(a.x - b.x) + MathHelper.square(a.z - b.z));
+    private static double horizontalDistance(Vec3 a, Vec3 b) {
+        return Math.sqrt(Mth.square(a.x - b.x) + Mth.square(a.z - b.z));
     }
 
     private boolean isLoaded(int x, int z) {
-        return mc.world.getChunkManager().isChunkLoaded(x >> 4, z >> 4);
+        return mc.level.getChunkSource().hasChunk(x >> 4, z >> 4);
     }
 }
