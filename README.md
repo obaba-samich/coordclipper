@@ -53,7 +53,7 @@ Settings are in the **coord-clipper** module (Movement category). The module doe
 | `stuck-timeout`      | 5       | Give up after this many seconds without a way closer.          |
 | `drown-protection`   | on      | Find air when you're about to drown.                           |
 | `air-bubbles`        | 1       | Bubbles left when it goes for air.                             |
-| `use-doors`          | on      | Place a door to breathe in when there's no open air in reach.  |
+| `use-doors`          | off     | Place a door to breathe in when there's no open air in reach.  |
 | `auto-eat`           | on      | Stop and eat when hungry.                                      |
 | `hunger-bars`        | 1       | Hunger bars left when it eats.                                 |
 | `eat-until`          | 10      | Hunger bars to eat up to.                                      |

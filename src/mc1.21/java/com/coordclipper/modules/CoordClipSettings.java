@@ -111,7 +111,7 @@ public class CoordClipSettings extends Module {
     public final Setting<Boolean> useDoors = sgAir.add(new BoolSetting.Builder()
         .name("use-doors")
         .description("If there's no open air in reach, place a door from your inventory where you stand and breathe inside it.")
-        .defaultValue(true)
+        .defaultValue(false)
         .visible(drownProtection::get)
         .build()
     );
