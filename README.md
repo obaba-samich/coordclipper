@@ -3,19 +3,7 @@
 A [Meteor Client](https://github.com/MeteorDevelopment/meteor-client) addon that pathfinds to coordinates with a chain
 of vclips and hclips and lands you on the nearest solid ground.
 
-## Versions
-
-Each Minecraft version has its own branch, and each release has a jar per version:
-
-| Minecraft | Branch   |
-|-----------|----------|
-| 1.21.11   | `main`   |
-| 1.21.10   | `1.21.10` |
-| 1.21.8    | `1.21.8` |
-| 1.21.7    | `1.21.7` |
-| 1.21.6    | `1.21.6` |
-| 1.21.5    | `1.21.5` |
-| 1.21.4    | `1.21.4` |
+Built for Minecraft 1.21.11.
 
 ## Usage
 
