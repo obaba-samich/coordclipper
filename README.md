@@ -14,13 +14,15 @@ one for your Minecraft version from the [releases](https://github.com/obaba-sami
 | `.coordclip <x> <y> <z>` | Clip to the coordinates. `~` relative coordinates work, e.g. `.coordclip ~ ~ ~100`. |
 | `.coordclip stop`        | Stop clipping.                                                                      |
 
-Settings are in the **coord-clipper** module (Movement category). The module doesn't need to be enabled.
+Settings are in the **coord-clipper** module (Movement category). The module doesn't need to be enabled. Change them in
+the GUI or with `.settings coord-clipper <setting> <value>`, e.g. `.settings coord-clipper max-move 9.5`.
 
 ## How it works
 
 - **One movement packet per tick.** Like Meteor's `.hclip`, it only moves you client side and lets the game's own
   movement packet carry the move, so the server never sees extra packets.
-- **Moves the server accepts.** Each move is at most 9.5 blocks (the server allows 10). The server replays a move
+- **Long moves.** Each move is up to **max-move** blocks, 100 by default. Vanilla servers only allow 10 per move, so
+  set it to 9.5 there. The server replays a move
   vertically first, then horizontally, and ignores the vertical difference, so moves go through floors and ceilings,
   but the horizontal part has to be clear. With **unlimited-vertical** on, clips straight up or down can be any length,
   so it clips to the right height in one move and then across.
@@ -44,11 +46,12 @@ Settings are in the **coord-clipper** module (Movement category). The module doe
 
 | Setting              | Default | Description                                                    |
 |----------------------|---------|----------------------------------------------------------------|
-| `max-move`           | 9.5     | Longest single move in blocks.                                 |
+| `max-move`           | 100     | Longest single move in blocks. Use 9.5 on vanilla servers.     |
 | `unlimited-vertical` | on      | Clip straight up or down any distance in one move.             |
 | `move-delay`         | 1       | Ticks between moves.                                           |
 | `landing-radius`     | 100     | How far from the target to look for ground to land on.         |
 | `max-air-stops`      | 10      | Most stops in a row in mid-air.                                |
+| `no-fall-damage`     | on      | Tells the server you're on the ground, so you don't take fall damage. |
 | `max-setbacks`       | 5       | Give up after this many setbacks in a row.                     |
 | `stuck-timeout`      | 5       | Give up after this many seconds without a way closer.          |
 | `drown-protection`   | on      | Find air when you're about to drown.                           |
@@ -61,6 +64,8 @@ Settings are in the **coord-clipper** module (Movement category). The module doe
 | `food-blacklist`     | ...     | Food it won't eat (golden apples, chorus fruit, rotten flesh…). |
 
 ## Troubleshooting
+
+To change a setting: `.settings coord-clipper <setting> <value>`.
 
 Problems are summarised in chat. Setbacks and other server problems are explained in detail in the game log
 (`.minecraft/logs/latest.log`), with lines prefixed `[CoordClip]`. For setbacks the log shows the move, where the server

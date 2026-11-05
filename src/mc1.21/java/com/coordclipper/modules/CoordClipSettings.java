@@ -28,10 +28,10 @@ public class CoordClipSettings extends Module {
 
     public final Setting<Double> maxHop = sgMovement.add(new DoubleSetting.Builder()
         .name("max-move")
-        .description("Longest single move in blocks. The server rejects moves over 10 blocks.")
-        .defaultValue(9.5)
-        .range(1, 9.9)
-        .sliderRange(1, 9.9)
+        .description("Longest single move in blocks. Vanilla servers put you back for moves over 10 blocks, so lower it to 9.5 if you keep getting put back.")
+        .defaultValue(100)
+        .range(1, 100)
+        .sliderRange(1, 100)
         .build()
     );
 
@@ -70,6 +70,13 @@ public class CoordClipSettings extends Module {
     );
 
     // Safety
+
+    public final Setting<Boolean> noFallDamage = sgSafety.add(new BoolSetting.Builder()
+        .name("no-fall-damage")
+        .description("Tells the server you're on the ground while clipping, so clipping down or being held in mid-air doesn't hurt when you land.")
+        .defaultValue(true)
+        .build()
+    );
 
     public final Setting<Integer> maxSetbacks = sgSafety.add(new IntSetting.Builder()
         .name("max-setbacks")
@@ -173,12 +180,12 @@ public class CoordClipSettings extends Module {
     );
 
     public CoordClipSettings() {
-        super(Categories.Movement, "coord-clipper", "Settings for .coordclip. Doesn't need to be enabled.");
+        super(Categories.Movement, "coord-clipper", "Settings for .coordclip. Doesn't need to be enabled. Change them here or with .settings coord-clipper <setting> <value>.");
     }
 
     @Override
     public void onActivate() {
-        info("This module only holds the settings for .coordclip, it doesn't need to be enabled.");
+        info("This module only holds the settings for .coordclip, it doesn't need to be enabled. Change them with (highlight).settings coord-clipper <setting> <value>(default).");
         toggle();
     }
 

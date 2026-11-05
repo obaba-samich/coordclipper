@@ -3,11 +3,13 @@ package com.coordclipper.utils;
 import com.mojang.brigadier.arguments.ArgumentType;
 import com.mojang.brigadier.context.CommandContext;
 import meteordevelopment.meteorclient.commands.arguments.BlockPosArgumentType;
+import meteordevelopment.meteorclient.mixin.ServerboundMovePlayerPacketAccessor;
 import net.minecraft.core.BlockPos;
+import net.minecraft.network.protocol.game.ClientboundPlayerPositionPacket;
+import net.minecraft.network.protocol.game.ServerboundMovePlayerPacket;
 import net.minecraft.world.entity.Entity;
 import net.minecraft.world.entity.PositionMoveRotation;
 import net.minecraft.world.entity.player.Player;
-import net.minecraft.network.protocol.game.ClientboundPlayerPositionPacket;
 import net.minecraft.world.phys.Vec3;
 
 /**
@@ -48,5 +50,12 @@ public final class Compat {
 
     public static BlockPos getBlockPos(CommandContext<?> context, String name) {
         return BlockPosArgumentType.getBlockPos(context, name);
+    }
+
+    /**
+     * Marks an outgoing movement packet as on the ground.
+     */
+    public static void setOnGround(ServerboundMovePlayerPacket packet) {
+        ((ServerboundMovePlayerPacketAccessor) packet).meteor$setOnGround(true);
     }
 }
