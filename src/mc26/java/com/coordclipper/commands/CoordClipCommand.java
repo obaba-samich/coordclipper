@@ -31,6 +31,7 @@ import net.minecraft.world.entity.Pose;
 import net.minecraft.world.level.material.FluidState;
 import net.minecraft.world.item.BlockItem;
 import net.minecraft.world.item.ItemStack;
+import net.minecraft.network.protocol.game.ServerboundMovePlayerPacket;
 import net.minecraft.network.protocol.game.ClientboundPlayerPositionPacket;
 import net.minecraft.tags.FluidTags;
 import net.minecraft.core.BlockPos;
@@ -91,6 +92,11 @@ public class CoordClipCommand extends Command {
 
     private static final int RETRY_DELAY = 10;
     private static final int SEARCH_RETRY = 5;
+    // Columns within this many blocks are all checked for spots to stand on, beyond that (with long moves) only a grid
+    // of them is, and only at heights within this many blocks and the top of the column. Checking every block within
+    // 100 blocks for every step would take forever
+    private static final int NEAR = 10;
+    private static final int FAR_COLUMNS = 24;
     // Longest it holds still in mid-air before dropping to the ground, well under the server's 80 tick floating kick
     private static final int MAX_AIR_HOLD_TICKS = 40;
     // Planned moves thrown away in a row that get logged, after that only the total is
@@ -152,6 +158,8 @@ public class CoordClipCommand extends Command {
     // Settings, read when a clip starts
     private CoordClipSettings settings;
     private double maxHop, maxHopSq, maxHopSent;
+    // Column offsets checked for spots to stand on within one move: all of them nearby, a grid further out
+    private int[][] columns;
     private int reach, moveDelay, maxSetbacks, stuckTimeout, maxAirStops, landingRadius;
     private boolean unlimitedVertical;
 
@@ -205,8 +213,20 @@ public class CoordClipCommand extends Command {
         settings = CoordClipSettings.get();
         maxHop = settings.maxHop.get();
         maxHopSq = maxHop * maxHop;
-        maxHopSent = Math.min(maxHop + 0.4, 9.9);
+        // A little slack for spots off the block grid, but never past the vanilla limit when the setting is under it
+        maxHopSent = maxHop < 10 ? Math.min(maxHop + 0.4, 9.9) : maxHop + 0.4;
         reach = (int) maxHop;
+
+        int step = Math.max(1, (int) Math.ceil(2.0 * reach / FAR_COLUMNS));
+        List<int[]> offsets = new ArrayList<>();
+        for (int dx = -reach; dx <= reach; dx++) {
+            for (int dz = -reach; dz <= reach; dz++) {
+                if (dx * dx + dz * dz > maxHopSq) continue;
+                boolean near = Math.abs(dx) <= NEAR && Math.abs(dz) <= NEAR;
+                if (near || (dx % step == 0 && dz % step == 0)) offsets.add(new int[] {dx, dz});
+            }
+        }
+        columns = offsets.toArray(new int[0][]);
         unlimitedVertical = settings.unlimitedVertical.get();
         moveDelay = settings.moveDelay.get();
         maxSetbacks = settings.maxSetbacks.get();
@@ -541,6 +561,17 @@ public class CoordClipCommand extends Command {
         }
     }
 
+    /**
+     * Tells the server every movement packet is on the ground while clipping, so it never adds up a fall: being held
+     * in mid-air counts as falling a little every tick, and that would all be taken as fall damage on landing.
+     */
+    @EventHandler
+    private void onPacketSend(PacketEvent.Send event) {
+        if (settings.noFallDamage.get() && event.packet instanceof ServerboundMovePlayerPacket packet) {
+            Compat.setOnGround(packet);
+        }
+    }
+
     @EventHandler
     private void onGameLeft(GameLeftEvent event) {
         log("Disconnected after %d moves, stopped.", moves);
@@ -752,14 +783,16 @@ public class CoordClipCommand extends Command {
         Vec3 best = null;
         double bestDist = Double.MAX_VALUE;
 
-        for (int dx = -reach; dx <= reach; dx++) {
-            for (int dz = -reach; dz <= reach; dz++) {
+        // Air is usually close by, so only look nearby even with long moves
+        int near = Math.min(reach, NEAR);
+        for (int dx = -near; dx <= near; dx++) {
+            for (int dz = -near; dz <= near; dz++) {
                 int x = fx + dx, z = fz + dz;
                 boolean ownColumn = dx == 0 && dz == 0;
                 if (dx * dx + dz * dz > maxHopSq || !isLoaded(x, z)) continue;
 
-                int up = ownColumn && unlimitedVertical ? BREATH_SEARCH_UP : reach;
-                for (int y = fy - reach; y <= fy + up; y++) {
+                int up = ownColumn && unlimitedVertical ? BREATH_SEARCH_UP : near;
+                for (int y = fy - near; y <= fy + up; y++) {
                     Vec3 spot = ownColumn ? new Vec3(from.x, y, from.z) : new Vec3(x + 0.5, y, z + 0.5);
                     double dist = spot.distanceTo(from);
                     if (dist >= bestDist || (!(ownColumn && unlimitedVertical) && dist > maxHop)) continue;
@@ -1248,35 +1281,39 @@ public class CoordClipCommand extends Command {
             double vx = node.vec.x, vy = node.vec.y, vz = node.vec.z;
             int nx = Mth.floor(vx), nz = Mth.floor(vz);
 
-            // Ground spots within one move. Only the column's y range that's in reach is checked
-            for (int dx = -reach; dx <= reach; dx++) {
-                int x = nx + dx;
-                double hx = x + 0.5 - vx;
+            // Ground spots within one move: every column nearby and a grid of them further out
+            for (int[] column : columns) {
+                int x = nx + column[0], z = nz + column[1];
+                double hx = x + 0.5 - vx, hz = z + 0.5 - vz;
+                double horizontalSq = hx * hx + hz * hz;
+                if (horizontalSq > maxHopSq || horizontalSq < 1.0E-6 || !isLoaded(x, z)) continue;
 
-                for (int dz = -reach; dz <= reach; dz++) {
-                    int z = nz + dz;
-                    double hz = z + 0.5 - vz;
-                    double horizontalSq = hx * hx + hz * hz;
-                    if (horizontalSq > maxHopSq || horizontalSq < 1.0E-6 || !isLoaded(x, z)) continue;
+                // With long moves only heights near the current one and the top of the column, vertical clips get the rest
+                double dyMax = Math.sqrt(maxHopSq - horizontalSq);
+                boolean clipped = dyMax > NEAR;
+                if (clipped) dyMax = NEAR;
+                int minY = Math.max(bottomY, Mth.floor(vy - dyMax) - 1);
+                int maxY = Math.min(topY - 1, Mth.floor(vy + dyMax));
 
-                    double dyMax = Math.sqrt(maxHopSq - horizontalSq);
-                    int minY = Math.max(bottomY, Mth.floor(vy - dyMax) - 1);
-                    int maxY = Math.min(topY - 1, Mth.floor(vy + dyMax));
-
-                    for (int y = minY; y <= maxY; y++) {
-                        double standY = standHeight(x, y, z);
-                        if (Double.isNaN(standY)) continue;
-
-                        Vec3 vec = new Vec3(x + 0.5, standY, z + 0.5);
-                        if (node.vec.distanceToSqr(vec) > maxHopSq) continue;
-                        if (exhaustive && (!isSpot(vec) || !canMove(node.vec, vec))) continue;
-                        add(vec, node, 0, exhaustive);
-                    }
+                for (int y = minY; y <= maxY; y++) addGround(node, x, y, z);
+                if (clipped) {
+                    int surface = mc.level.getHeight(Heightmap.Types.MOTION_BLOCKING, x, z);
+                    if (surface < minY || surface > maxY) addGround(node, x, surface, z);
                 }
             }
 
             verticalClips(node);
             airStops(node);
+        }
+
+        void addGround(Node node, int x, int y, int z) {
+            double standY = standHeight(x, y, z);
+            if (Double.isNaN(standY)) return;
+
+            Vec3 vec = new Vec3(x + 0.5, standY, z + 0.5);
+            if (node.vec.distanceToSqr(vec) > maxHopSq) return;
+            if (exhaustive && (!isSpot(vec) || !canMove(node.vec, vec))) return;
+            add(vec, node, 0, exhaustive);
         }
 
         /**
@@ -1363,11 +1400,10 @@ public class CoordClipCommand extends Command {
             int x0 = Mth.floor(vec.x), z0 = Mth.floor(vec.z);
             int top = Mth.floor(vec.y);
 
-            for (int dx = -reach; dx <= reach; dx++) {
-                for (int dz = -reach; dz <= reach; dz++) {
-                    if (dx * dx + dz * dz > maxHopSq || !isLoaded(x0 + dx, z0 + dz)) continue;
-                    top = Math.max(top, mc.level.getHeight(Heightmap.Types.MOTION_BLOCKING, x0 + dx, z0 + dz));
-                }
+            for (int[] column : columns) {
+                int x = x0 + column[0], z = z0 + column[1];
+                if (!isLoaded(x, z)) continue;
+                top = Math.max(top, mc.level.getHeight(Heightmap.Types.MOTION_BLOCKING, x, z));
             }
 
             return top + 0.1;

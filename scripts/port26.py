@@ -21,6 +21,8 @@ imports = {
  'net.minecraft.item.ItemStack':'net.minecraft.world.item.ItemStack',
  'net.minecraft.item.Item':'net.minecraft.world.item.Item',
  'net.minecraft.item.Items':'net.minecraft.world.item.Items',
+ 'net.minecraft.network.packet.c2s.play.PlayerMoveC2SPacket':'net.minecraft.network.protocol.game.ServerboundMovePlayerPacket',
+ 'meteordevelopment.meteorclient.mixin.PlayerMoveC2SPacketAccessor':'meteordevelopment.meteorclient.mixin.ServerboundMovePlayerPacketAccessor',
  'net.minecraft.network.packet.s2c.play.PlayerPositionLookS2CPacket':'net.minecraft.network.protocol.game.ClientboundPlayerPositionPacket',
  'net.minecraft.registry.tag.FluidTags':'net.minecraft.tags.FluidTags',
  'net.minecraft.util.math.BlockPos':'net.minecraft.core.BlockPos',
@@ -39,7 +41,7 @@ def port(s):
         s = s.replace('import net.minecraft.world.entity.Entity;', 'import net.minecraft.world.entity.Entity;\nimport net.minecraft.world.entity.Pose;')
     words = [
      ('PlayerListEntry','PlayerInfo'),('CommandSource','ClientSuggestionProvider'),('DataComponentTypes','DataComponents'),
-     ('PlayerPositionLookS2CPacket','ClientboundPlayerPositionPacket'),('EntityPosition','PositionMoveRotation'),
+     ('PlayerPositionLookS2CPacket','ClientboundPlayerPositionPacket'),('PlayerMoveC2SPacketAccessor','ServerboundMovePlayerPacketAccessor'),('PlayerMoveC2SPacket','ServerboundMovePlayerPacket'),('EntityPosition','PositionMoveRotation'),
      ('PlayerEntity','Player'),('Box','AABB'),('MathHelper','Mth'),('Vec3d','Vec3'),('BlockPos.Mutable','BlockPos.MutableBlockPos'),
      ('Heightmap.Type','Heightmap.Types'),
     ]
