@@ -73,7 +73,7 @@ public class CoordClipSettings extends Module {
 
     public final Setting<Boolean> noFallDamage = sgSafety.add(new BoolSetting.Builder()
         .name("no-fall-damage")
-        .description("Tells the server you're on the ground while clipping, so clipping down or being held in mid-air doesn't hurt when you land.")
+        .description("Keeps clips down and being held in mid-air from doing fall damage.")
         .defaultValue(true)
         .build()
     );
