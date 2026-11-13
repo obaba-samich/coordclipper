@@ -1244,6 +1244,9 @@ public class CoordClipCommand extends Command {
         final Vec3 goalVec;
         final BlockPos target;
         final boolean exhaustive;
+        // Check every spot as it's found instead of when it's picked. Only with short moves: with long ones there are
+        // thousands of spots per step and checking the way to each one at once freezes the game
+        final boolean eager;
         final double weight;
         final int maxExpansions;
         final int bottomY, topY;
@@ -1265,6 +1268,7 @@ public class CoordClipCommand extends Command {
             this.goalVec = goalVec;
             this.target = target;
             this.exhaustive = exhaustive;
+            this.eager = exhaustive && maxHop <= NEAR;
             this.weight = exhaustive ? 1 : HEURISTIC_WEIGHT;
             this.maxExpansions = exhaustive ? MAX_EXHAUSTIVE_EXPANSIONS : MAX_EXPANSIONS;
             this.bottomY = mc.level.getMinY();
@@ -1375,8 +1379,8 @@ public class CoordClipCommand extends Command {
 
             Vec3 vec = new Vec3(x + 0.5, standY, z + 0.5);
             if (node.vec.distanceToSqr(vec) > maxHopSq) return;
-            if (exhaustive && (!isSpot(vec) || !canMove(node.vec, vec))) return;
-            add(vec, node, 0, exhaustive);
+            if (eager && (!isSpot(vec) || !canMove(node.vec, vec))) return;
+            add(vec, node, 0, eager);
         }
 
         /**
