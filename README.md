@@ -3,9 +3,9 @@
 A [Meteor Client](https://github.com/MeteorDevelopment/meteor-client) addon that pathfinds to coordinates with a chain
 of vclips and hclips and lands you on the nearest solid ground.
 
-Built and tested for Minecraft **1.21.11**. Jars for 1.21.4 to 1.21.10 (except 1.21.9, which Meteor skipped) and
-26.1.2 to 26.3 are **experimental**: they compile, but haven't been tested in game. Each version has its own jar, get the
-one for your Minecraft version from the [releases](https://github.com/obaba-samich/coordclipper/releases).
+For Minecraft 1.21.4, 1.21.5, 1.21.6, 1.21.7, 1.21.8, 1.21.10, 1.21.11, 26.1.2, 26.2 and 26.3 (26.x needs Java 25). Each
+version has its own jar, get the one for your Minecraft version from the
+[releases](https://github.com/obaba-samich/coordclipper/releases).
 
 ## Usage
 
