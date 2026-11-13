@@ -3,7 +3,9 @@ package com.coordclipper.utils;
 import com.mojang.brigadier.arguments.ArgumentType;
 import com.mojang.brigadier.context.CommandContext;
 import meteordevelopment.meteorclient.commands.arguments.BlockPosArgumentType;
+import meteordevelopment.meteorclient.mixin.LocalPlayerAccessor;
 import meteordevelopment.meteorclient.mixin.ServerboundMovePlayerPacketAccessor;
+import net.minecraft.client.player.LocalPlayer;
 import net.minecraft.core.BlockPos;
 import net.minecraft.network.protocol.game.ClientboundPlayerPositionPacket;
 import net.minecraft.network.protocol.game.ServerboundMovePlayerPacket;
@@ -52,10 +54,18 @@ public final class Compat {
         return BlockPosArgumentType.getBlockPos(context, name);
     }
 
+    public static void setOnGround(ServerboundMovePlayerPacket packet, boolean onGround) {
+        ((ServerboundMovePlayerPacketAccessor) packet).meteor$setOnGround(onGround);
+    }
+
+    public static void setY(ServerboundMovePlayerPacket packet, double y) {
+        ((ServerboundMovePlayerPacketAccessor) packet).meteor$setY(y);
+    }
+
     /**
-     * Marks an outgoing movement packet as on the ground.
+     * Makes the game send the player's position with the next movement packet even if it hasn't changed.
      */
-    public static void setOnGround(ServerboundMovePlayerPacket packet) {
-        ((ServerboundMovePlayerPacketAccessor) packet).meteor$setOnGround(true);
+    public static void forcePositionPacket(LocalPlayer player) {
+        ((LocalPlayerAccessor) player).meteor$setPositionReminder(20);
     }
 }

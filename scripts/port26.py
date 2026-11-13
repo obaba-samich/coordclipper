@@ -89,6 +89,7 @@ def port(s):
      (r'(\bshape|\bbox|\bbase|getBoundingBox\(\))\.offset\(', r'\1.move('),
  (r'(hitboxAt\([^)]*\))\.offset\(', r'\1.move('),
      (r'\.getComponents\(\)\.get\(','.components().get('),
+ (r'\.changesPosition\(\)','.hasPosition()'),
     ]
     for a, b in subs:
         s = re.sub(a, b, s)

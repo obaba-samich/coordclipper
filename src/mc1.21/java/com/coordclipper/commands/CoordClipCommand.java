@@ -98,6 +98,10 @@ public class CoordClipCommand extends Command {
     private static final int FAR_COLUMNS = 24;
     // Longest it holds still in mid-air before dropping to the ground, well under the server's 80 tick floating kick
     private static final int MAX_AIR_HOLD_TICKS = 40;
+    // Drops the server can take without fall damage (it's safe up to 3 blocks), and how far up the move after a longer
+    // drop is lifted to clear the fall
+    private static final double SAFE_DROP = 2.5;
+    private static final double FALL_RESET_LIFT = 0.01;
     // Planned moves thrown away in a row that get logged, after that only the total is
     private static final int LOGGED_DISCARDS = 5;
 
@@ -146,6 +150,12 @@ public class CoordClipCommand extends Command {
     private double bestRemaining;
     private int noProgressTicks, ticksSinceMove, discards;
     private long startTime;
+    // Fall damage: the height of the last position sent, and whether the server is counting a fall that the next
+    // movement packet has to clear
+    private double sentY;
+    private boolean clearFall;
+    // Set when giving up in mid-air: it drops to the ground first and stops with this message once the fall is cleared
+    private String stopMessage;
     // Where the server teleported us, set from the network thread
     private volatile Vec3d serverTeleport;
 
@@ -193,6 +203,9 @@ public class CoordClipCommand extends Command {
             noProgressTicks = ticksSinceMove = discards = 0;
             bestRemaining = Double.MAX_VALUE;
             rejectedStops.clear();
+            sentY = mc.player.getY();
+            clearFall = false;
+            stopMessage = null;
             pause = Pause.NONE;
             warnedNoAir = warnedNoFood = false;
             pending.clear();
@@ -257,6 +270,20 @@ public class CoordClipCommand extends Command {
         }
 
         prunePending();
+
+        if (clearFall) Compat.forcePositionPacket(mc.player);
+        if (stopMessage != null) {
+            if (last != null) {
+                mc.player.setPosition(last);
+                mc.player.setVelocity(Vec3d.ZERO);
+            }
+            if (!clearFall && ++ticksSinceMove > 1) {
+                String message = stopMessage;
+                stop();
+                error(message.replace("%", "%%"));
+            }
+            return;
+        }
 
         if (++spotCacheAge > SPOT_CACHE_TICKS) clearCaches();
 
@@ -556,19 +583,47 @@ public class CoordClipCommand extends Command {
     @EventHandler
     private void onPacketReceive(PacketEvent.Receive event) {
         if (event.packet instanceof PlayerPositionLookS2CPacket packet) {
-            serverTeleport = Compat.teleportTarget(packet, mc.player);
+            Vec3d target = Compat.teleportTarget(packet, mc.player);
+            serverTeleport = target;
+            // The game confirms the teleport with a movement packet right away, from the new height
+            sentY = target.y;
         }
     }
 
     /**
-     * Tells the server every movement packet is on the ground while clipping, so it never adds up a fall: being held
-     * in mid-air counts as falling a little every tick, and that would all be taken as fall damage on landing.
+     * Keeps clips down from doing fall damage. The server adds every move's drop to the fall distance and deals the
+     * damage as soon as a packet says the player is on the ground, including the drop of that same packet. It only
+     * forgets the fall when the player moves up. So moves dropping more than a few blocks are sent as in the air, and
+     * the next movement packet is lifted a hair above the last one to clear the fall. Every other packet says on the
+     * ground, so being held in mid-air (gravity pulls the player down a little every tick) never adds up.
      */
     @EventHandler
     private void onPacketSend(PacketEvent.Send event) {
-        if (settings.noFallDamage.get() && event.packet instanceof PlayerMoveC2SPacket packet) {
-            Compat.setOnGround(packet);
+        if (!settings.noFallDamage.get() || !(event.packet instanceof PlayerMoveC2SPacket packet)) return;
+
+        if (!packet.changesPosition()) {
+            Compat.setOnGround(packet, !clearFall);
+            return;
         }
+
+        double y = packet.getY(sentY);
+        double dy = y - sentY;
+        if (dy < -SAFE_DROP) {
+            Compat.setOnGround(packet, false);
+            clearFall = true;
+        }
+        else if (clearFall) {
+            Compat.setOnGround(packet, false);
+            if (dy > 0) clearFall = false;
+            else if (dy > -0.5) {
+                y = sentY + FALL_RESET_LIFT;
+                Compat.setY(packet, y);
+                clearFall = false;
+            }
+        }
+        else Compat.setOnGround(packet, true);
+
+        sentY = y;
     }
 
     @EventHandler
@@ -584,18 +639,26 @@ public class CoordClipCommand extends Command {
         pending.clear();
         search = null;
         goal = null;
+        stopMessage = null;
         MeteorClient.EVENT_BUS.unsubscribe(this);
     }
 
     private void fail(String chat) {
         // Don't leave the player hanging in the air to fall once it lets go
-        if (!mc.player.isDead()) {
+        if (!mc.player.isDead() && stopMessage == null) {
             Vec3d pos = Compat.pos(mc.player);
             if (!canWaitAt(pos)) {
                 Vec3d ground = findGroundBelow(pos);
                 if (ground != null) {
                     log("Stopping in mid-air at %s, dropping to the ground at %s first.", fmt(pos), fmt(ground));
+                    discardRoute();
                     sendMove(pos, ground);
+
+                    // Stay a moment longer, so the fall from the drop is cleared before letting go
+                    if (settings.noFallDamage.get()) {
+                        stopMessage = chat;
+                        return;
+                    }
                 }
             }
         }
