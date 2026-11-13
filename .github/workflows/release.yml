@@ -24,16 +24,16 @@ jobs:
         uses: actions/setup-java@v4
         with:
           distribution: 'temurin'
-          java-version: 21
+          java-version: 25
 
-      - name: Build with Gradle
-        run: ./gradlew build
+      - name: Build every Minecraft version
+        run: ./build-all.sh
 
       - name: Release
         uses: softprops/action-gh-release@v2
         with:
           token: ${{ secrets.GITHUB_TOKEN }}
           name: Coord Clipper ${{ github.ref_name }}
-          generate_release_notes: true
+          body_path: .github/release-notes.md
           files: |
             ./build/libs/*.jar
