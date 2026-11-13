@@ -84,7 +84,9 @@ Needs JDK 25 or newer, for every version (older versions are still compiled for 
 ./build-all.sh 1.21.8 26.3       # only these
 ```
 
-Jars are written to `build/libs/` as `coord-clipper-mc<version>-<mod version>.jar`. Put the one for your Minecraft
+Jars are written to `build/libs/` as `coord-clipper-mc<version>-<mod version>.jar`. To have every build copied straight into
+your mods folder (replacing older Coord Clipper jars there), set the folder per version in `~/.gradle/gradle.properties`:
+`coordclipper.install.1.21.11=/path/to/.minecraft/mods`. Put the one for your Minecraft
 version in your `mods` folder next to Meteor Client for the same version.
 
 ### Layout

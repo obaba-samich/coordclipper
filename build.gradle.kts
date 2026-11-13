@@ -97,3 +97,22 @@ tasks {
         options.compilerArgs.add("-Xlint:unchecked")
     }
 }
+
+// Copies the jar into a mods folder after every build, replacing older Coord Clipper jars there. Set the folder per
+// Minecraft version in ~/.gradle/gradle.properties (not in this repo), e.g.
+// coordclipper.install.1.21.11=/path/to/.minecraft/mods
+val installDir = providers.gradleProperty("coordclipper.install.$mcVersion")
+val installJar = tasks.register("installJar") {
+    description = "Copies the jar into the mods folder set by coordclipper.install.<mc version>."
+    onlyIf { installDir.isPresent }
+    val jarName = "${base.archivesName.get()}-${project.version}.jar"
+    val jarFile = layout.buildDirectory.file("libs/$jarName")
+    doLast {
+        val mods = file(installDir.get())
+        require(mods.isDirectory) { "coordclipper.install.$mcVersion is not a folder: $mods" }
+        mods.listFiles { f -> f.name.startsWith("coord-clipper-") && f.name.endsWith(".jar") }!!.forEach { it.delete() }
+        jarFile.get().asFile.copyTo(mods.resolve(jarName))
+        logger.lifecycle("Installed $jarName to $mods")
+    }
+}
+tasks.named("build") { finalizedBy(installJar) }
