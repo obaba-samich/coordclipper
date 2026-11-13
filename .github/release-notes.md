@@ -2,13 +2,7 @@ Download the jar for your Minecraft version and put it in your `mods` folder nex
 
 **Settings:** change them with `.settings coord-clipper <setting> <value>`, e.g. `.settings coord-clipper max-move 9.5`.
 
-| Minecraft | Jar | Status |
-|---|---|---|
-| 1.21.11 | `coord-clipper-mc1.21.11-0.2.2.jar` | **Tested** |
-| 1.21.4 – 1.21.10 | `coord-clipper-mc1.21.x-0.2.2.jar` | Experimental |
-| 26.1.2, 26.2, 26.3 | `coord-clipper-mc26.x-0.2.2.jar` | Experimental (needs Java 25) |
-
-Experimental jars compile against their version but haven't been tested in game. Please report problems with the `[CoordClip]` lines from `.minecraft/logs/latest.log`.
+**Versions:** 1.21.4, 1.21.5, 1.21.6, 1.21.7, 1.21.8, 1.21.10, 1.21.11, 26.1.2, 26.2, 26.3 (26.x needs Java 25)
 
 ### Changes since 0.2.0
 - Builds for Minecraft 1.21.4 – 1.21.11 and 26.1.2 – 26.3
