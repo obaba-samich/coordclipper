@@ -1,4 +1,4 @@
-Discord: discord.gg/9VkBCGARzs
+[Discord](https://discord.gg/9VkBCGARzs)
 # Coord Clipper
 
 A [Meteor Client](https://github.com/MeteorDevelopment/meteor-client) addon that pathfinds to coordinates with a chain
